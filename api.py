@@ -1,15 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import tensorflow as tf
-import pickle
 import numpy as np
-import re
-import uvicorn
+import pickle
+import os
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from huggingface_hub import hf_hub_download
 
 app = FastAPI()
 
-# ── CORS ─────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,62 +17,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load LSTM model ───────────────────────────────────────────
-model = tf.keras.models.load_model('model/scam_model.h5')
+# ── Download model files from Hugging Face on startup ──
+REPO_ID = "AniruddhaS30/scamshield-model"
 
-# ── Load vectorizer ───────────────────────────────────────────
-with open('model/vectorizer.pkl', 'rb') as f:
-    saved_data = pickle.load(f)
+print("Downloading model files from Hugging Face...")
 
-vectorizer = tf.keras.layers.TextVectorization(
-    max_tokens=10000,
-    output_mode='int',
-    output_sequence_length=100
-)
-vectorizer.set_vocabulary(saved_data['vocabulary'])
+model_path      = hf_hub_download(repo_id=REPO_ID, filename="scam_model.h5")
+vectorizer_path = hf_hub_download(repo_id=REPO_ID, filename="vectorizer.pkl")
+encoder_path    = hf_hub_download(repo_id=REPO_ID, filename="label_encoder.pkl")
 
-# ── Load label encoder ────────────────────────────────────────
-with open('model/label_encoder.pkl', 'rb') as f:
-    le = pickle.load(f)
+print("Loading model...")
+model = load_model(model_path)
 
-print("Vocab size:", len(saved_data['vocabulary']))
-print("Classes:", le.classes_)
+with open(vectorizer_path, "rb") as f:
+    vectorizer = pickle.load(f)
 
-# ── Hinglish support ──────────────────────────────────────────
-from utils.hinglish_map import HINGLISH_TO_ENGLISH, normalize_hinglish
+with open(encoder_path, "rb") as f:
+    label_encoder = pickle.load(f)
 
-def preprocess(text: str) -> str:
-    text = normalize_hinglish(text)
-    text = re.sub(r'[^a-zA-Z0-9]', ' ', text)
-    return text.lower().strip()
+print("Model ready!")
 
-# ── Input model ───────────────────────────────────────────────
-class Message(BaseModel):
+# ── Request schema ──
+class TextInput(BaseModel):
     text: str
 
-# ── Routes ────────────────────────────────────────────────────
+# ── Predict endpoint ──
+@app.post("/predict")
+def predict(input: TextInput):
+    text = input.text.lower().strip()
+    sequences = vectorizer.texts_to_sequences([text])
+    padded = pad_sequences(sequences, maxlen=100)
+    prediction = model.predict(padded)
+    predicted_index = np.argmax(prediction, axis=1)[0]
+    predicted_label = label_encoder.inverse_transform([predicted_index])[0]
+    confidence = float(np.max(prediction))
+    return {
+        "label": predicted_label,
+        "confidence": round(confidence * 100, 2)
+    }
+
 @app.get("/")
 def root():
-    return {"status": "ScamShield AI API is running!"}
-
-@app.post("/predict")
-def predict(message: Message):
-    try:
-        clean = preprocess(message.text)
-        vec = vectorizer([clean])
-        pred = model.predict(vec, verbose=0)
-        idx = int(np.argmax(pred))
-        label = le.inverse_transform([idx])[0]
-        confidence = round(float(pred[0][idx]) * 100, 2)
-        is_scam = label in ['spam', 'smishing']
-        return {
-            "prediction": label,
-            "is_scam": is_scam,
-            "confidence": confidence,
-            "message": "⚠️ Scam Detected!" if is_scam else "✅ Looks Safe"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"status": "ScamShield API is running"}
